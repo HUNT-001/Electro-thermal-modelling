@@ -1,0 +1,61 @@
+{
+  "output_dir": "E:\\IML\\processed_data_v8\\tripB_only_final",
+  "total_rows": 627092,
+  "features_used": 31,
+  "metrics": [
+    {
+      "split": "Train",
+      "rows": 402241,
+      "active_rows": 389340,
+      "mae": 143.16842275613377,
+      "mse": 47648.5528860418,
+      "rmse": 218.2854848267328,
+      "r2": 0.9735361794666224,
+      "smape_pct": 10.433359678635485,
+      "mae_active_only": 147.14514187561,
+      "r2_active_only": 0.9726143877141886,
+      "smape_active_only_pct": 10.595687652165237,
+      "idle_detection_accuracy": 0.9988787816259407
+    },
+    {
+      "split": "Validation",
+      "rows": 115487,
+      "active_rows": 114621,
+      "mae": 313.57565171837524,
+      "mse": 198377.11089172543,
+      "rmse": 445.3954545027659,
+      "r2": 0.8330366984801333,
+      "smape_pct": 18.49470702931152,
+      "mae_active_only": 315.2524519067187,
+      "r2_active_only": 0.8299648389480142,
+      "smape_active_only_pct": 18.526258108846545,
+      "idle_detection_accuracy": 0.9993419172720739
+    },
+    {
+      "split": "Test",
+      "rows": 109364,
+      "active_rows": 97838,
+      "mae": 391.34195009326646,
+      "mse": 364266.92684098333,
+      "rmse": 603.5452980853909,
+      "r2": 0.7361783306334666,
+      "smape_pct": 42.38384868062417,
+      "mae_active_only": 302.65255861730617,
+      "r2_active_only": 0.8029857307134552,
+      "smape_active_only_pct": 24.07722180653512,
+      "idle_detection_accuracy": 0.8727094839252405
+    }
+  ],
+  "classifier_stats": [
+    {
+      "split": "Validation",
+      "accuracy": 0.9993419172720739,
+      "f1": 0.9993326073029828
+    },
+    {
+      "split": "Test",
+      "accuracy": 0.8727094839252405,
+      "f1": 0.8356280856701943
+    }
+  ]
+}
