@@ -210,18 +210,3 @@ print("Predicted heating power (W):", pred)
 ```
 
 ---
-
-## 👥 Team
-
-| Name | Reg No |
-|---|---|
-| Tanush Pavan V | CB.EN.U4EEE24147 |
-| Tejas | CB.EN.U4EEE24148 |
-| Thirupugazhl | CB.EN.U4EEE24149 |
-| Harish V | CB.EN.U4EEE24115 |
-
-**Department:** Electrical and Electronics Engineering
-**Institution:** Amrita School of Engineering
-**Date:** March 2026
-
----
