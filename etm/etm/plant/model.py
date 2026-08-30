@@ -81,6 +81,14 @@ PLAUSIBLE_RANGES: dict[str, tuple[float, float]] = {
     "eta": (0.3, 1.0),            # electrical -> delivered heat
     "tau_h": (2.0, 300.0),        # s
     "cop_ac": (0.5, 6.0),         # cooling W per electrical W
+    # Interior mass time constant.  Seats, trim and structure release heat over
+    # tens of minutes; anything under a few minutes is not thermal mass.
+    "tau_mass": (300.0, 7200.0),  # s
+    # mdot * cp for the level-1 automatic blower.  Measured directly from the
+    # winter trips: over segments with the heater above 2 kW, P_heat divided by
+    # (duct temperature - cabin temperature) has a median of 62 W/K on TripB05,
+    # 77 on TripB18 and 144 on TripB09.
+    "mdot_cp": (30.0, 180.0),     # W/K
 }
 
 
@@ -110,6 +118,8 @@ class PlantParams:
     eta: float
     tau_h: float
     cop_ac: float
+    tau_mass: float = float("nan")
+    mdot_cp: float = float("nan")
 
     def implausible(self) -> dict[str, tuple[float, tuple[float, float]]]:
         """Parameters outside their physically defensible range."""
@@ -132,7 +142,8 @@ class PlantParams:
         return (f"C_cab={self.c_cab:,.0f} J/K  C_mass={self.c_mass:,.0f} J/K  "
                 f"UA0={self.ua0:.1f} W/K  UA1={self.ua1:.2f} W/K/(m/s)  "
                 f"UA_mass={self.ua_mass:.1f} W/K  eta={self.eta:.3f}  "
-                f"tau_h={self.tau_h:.1f} s  COP={self.cop_ac:.2f}")
+                f"tau_h={self.tau_h:.1f} s  tau_mass={self.tau_mass / 60:.1f} min  "
+                f"mdot_cp={self.mdot_cp:.1f} W/K  COP={self.cop_ac:.2f}")
 
 
 class ResidualNet(nn.Module):
@@ -182,13 +193,24 @@ class RCPlant(nn.Module):
         self.aux_max_w = aux_max_w
 
         self._c_cab = nn.Parameter(torch.tensor(_inv_softplus(1.0e5 / 1e4)))
-        self._c_mass = nn.Parameter(torch.tensor(_inv_softplus(4.0e5 / 1e4)))
+        # The interior mass is parameterised by its *time constant*, not its
+        # capacitance.  Fitted as (C_mass, UA_mass) the pair is degenerate and
+        # collapses: a 5-fold run on the winter trips drove C_mass to ~900 J/K
+        # against a UA_mass of ~35 W/K, i.e. a 26 s time constant.  That is not
+        # an interior thermal mass any more, it is a second fast filter, and a
+        # model with no slow storage lets a planner believe it can dump the
+        # cabin's heat and get it straight back.
+        self._tau_mass = nn.Parameter(torch.tensor(_inv_softplus(1800.0 / 60.0)))
         self._ua0 = nn.Parameter(torch.tensor(_inv_softplus(55.0)))
         self._ua1 = nn.Parameter(torch.tensor(_inv_softplus(2.0)))
         self._ua_mass = nn.Parameter(torch.tensor(_inv_softplus(60.0)))
         self._eta = nn.Parameter(torch.tensor(_inv_sigmoid_scaled(0.85, *PLAUSIBLE_RANGES["eta"])))
         self._tau_h = nn.Parameter(torch.tensor(_inv_softplus(30.0 - 1.0)))
         self._cop_ac = nn.Parameter(torch.tensor(_inv_softplus(2.0)))
+        # Blower thermal capacity rate, mdot * cp.  Observing the delivery air
+        # temperature through this is what makes eta identifiable at all -- see
+        # vent_temp().
+        self._mdot_cp = nn.Parameter(torch.tensor(_inv_softplus(70.0)))
         self._aux = nn.Parameter(torch.zeros(n_trips))
 
         self.residual = ResidualNet(max_w=residual_max_w) if use_residual else None
@@ -199,8 +221,17 @@ class RCPlant(nn.Module):
         return nn.functional.softplus(self._c_cab) * 1e4
 
     @property
+    def tau_mass(self) -> Tensor:
+        """Time constant of the interior mass, in seconds."""
+        return nn.functional.softplus(self._tau_mass) * 60.0
+
+    @property
     def c_mass(self) -> Tensor:
-        return nn.functional.softplus(self._c_mass) * 1e4
+        return self.tau_mass * self.ua_mass
+
+    @property
+    def mdot_cp(self) -> Tensor:
+        return nn.functional.softplus(self._mdot_cp)
 
     @property
     def ua0(self) -> Tensor:
@@ -231,8 +262,9 @@ class RCPlant(nn.Module):
         return self.aux_max_w * torch.tanh(self._aux[trip_idx])
 
     #: Values the parameters start at, from first-principles estimates.
-    INITIAL = dict(c_cab=1.0e5, c_mass=4.0e5, ua0=55.0, ua1=2.0,
-                   ua_mass=60.0, eta=0.85, tau_h=30.0, cop_ac=2.0)
+    INITIAL = dict(c_cab=1.0e5, ua0=55.0, ua1=2.0, ua_mass=60.0,
+                   eta=0.85, tau_h=30.0, cop_ac=2.0,
+                   tau_mass=1800.0, mdot_cp=70.0)
 
     def movement_from_initial(self) -> dict[str, float]:
         """Relative distance each parameter has travelled from its starting value.
@@ -257,7 +289,27 @@ class RCPlant(nn.Module):
                 ua0=float(self.ua0), ua1=float(self.ua1),
                 ua_mass=float(self.ua_mass), eta=float(self.eta),
                 tau_h=float(self.tau_h), cop_ac=float(self.cop_ac),
+                tau_mass=float(self.tau_mass), mdot_cp=float(self.mdot_cp),
             )
+
+    def vent_temp(self, state: Tensor) -> Tensor:
+        """Delivery air temperature implied by the current state.
+
+        With the blower at a fixed setting the heat carried into the cabin is
+        ``mdot*cp*(T_vent - T_cab)``, so the measured duct temperature is a
+        second, direct observation of ``Q_del``.
+
+        This is what breaks the worst degeneracy in the model.  Fitted against
+        cabin temperature alone, only the *ratio* ``eta / C_cab`` is
+        constrained -- the 5-fold winter run landed on two different solutions,
+        (eta 0.43, C_cab 50 kJ/K) on three folds and (eta 0.80, C_cab 99 kJ/K)
+        on the other two, both fitting about as well.  Observing the duct
+        temperature adds ``eta / (mdot*cp)``, and since a level-1 blower moves a
+        physically known amount of air, ``mdot*cp`` is pinned by its plausible
+        range and ``eta`` becomes separately identifiable.
+        """
+        t_cab, _, q_del = state.unbind(-1)
+        return t_cab + q_del / self.mdot_cp
 
     # -- dynamics ----------------------------------------------------------
     def derivatives(self, state: Tensor, u: Tensor, aux: Tensor) -> Tensor:
