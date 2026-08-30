@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etm"
+version = "0.1.0"
+description = "Electro-thermal demand forecasting and cabin-heating control for BEVs"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14",
+    "openpyxl>=3.1",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+model = ["xgboost>=2.0", "torch>=2.2"]
+control = ["gymnasium>=0.29", "stable-baselines3>=2.2", "cvxpy>=1.4"]
+track = ["mlflow>=2.10", "hydra-core>=1.3"]
+dev = ["pytest>=8.0", "pytest-cov", "ruff>=0.4"]
+
+[project.scripts]
+etm = "etm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["etm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: identification fits; minutes on CPU, seconds on GPU"]
+addopts = "-m 'not slow'"
+
+[tool.ruff]
+line-length = 100
