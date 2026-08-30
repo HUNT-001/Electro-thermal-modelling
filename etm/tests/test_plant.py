@@ -14,8 +14,9 @@ from etm.plant.windows import build_windows
 # synthetic ground truth
 # --------------------------------------------------------------------------
 
-TRUE = dict(c_cab=1.2e5, c_mass=5.0e5, ua0=62.0, ua1=3.0,
-            ua_mass=75.0, eta=0.88, tau_h=25.0, cop_ac=2.2)
+TRUE = dict(c_cab=1.2e5, ua0=62.0, ua1=3.0, ua_mass=75.0, eta=0.88,
+            tau_h=25.0, cop_ac=2.2, tau_mass=1500.0, mdot_cp=48.0)
+TRUE_C_MASS = TRUE["tau_mass"] * TRUE["ua_mass"]      # 112 500 J/K
 
 
 def _oracle(n_trips: int = 1) -> RCPlant:
@@ -25,7 +26,8 @@ def _oracle(n_trips: int = 1) -> RCPlant:
         prm.requires_grad_(False)
     with torch.no_grad():
         m._c_cab.copy_(torch.tensor(np.log(np.expm1(TRUE["c_cab"] / 1e4))))
-        m._c_mass.copy_(torch.tensor(np.log(np.expm1(TRUE["c_mass"] / 1e4))))
+        m._tau_mass.copy_(torch.tensor(np.log(np.expm1(TRUE["tau_mass"] / 60.0))))
+        m._mdot_cp.copy_(torch.tensor(np.log(np.expm1(TRUE["mdot_cp"]))))
         m._ua0.copy_(torch.tensor(np.log(np.expm1(TRUE["ua0"]))))
         m._ua1.copy_(torch.tensor(np.log(np.expm1(TRUE["ua1"]))))
         m._ua_mass.copy_(torch.tensor(np.log(np.expm1(TRUE["ua_mass"]))))
@@ -189,16 +191,35 @@ def test_parameters_stay_positive_under_adversarial_gradients():
 
 
 def test_implausible_flags_a_nonsense_fit():
-    bad = PlantParams(c_cab=3.0, c_mass=1e5, ua0=62, ua1=3,
-                      ua_mass=75, eta=0.9, tau_h=25, cop_ac=2)
+    bad = PlantParams(c_cab=3.0, c_mass=1e5, ua0=62, ua1=3, ua_mass=75,
+                      eta=0.9, tau_h=25, cop_ac=2, tau_mass=1500, mdot_cp=48)
     assert "c_cab" in bad.implausible()
-    good = PlantParams(**TRUE)
+    good = PlantParams(c_mass=TRUE_C_MASS, **TRUE)
     assert not good.implausible()
+
+
+def test_collapsed_interior_mass_is_flagged():
+    """The failure mode the winter run actually produced: C_mass ~900 J/K
+    against UA_mass ~35 W/K, i.e. a 26 s 'thermal mass'."""
+    collapsed = PlantParams(c_cab=70_000, c_mass=911, ua0=41, ua1=0.13, ua_mass=34.6,
+                            eta=0.58, tau_h=58, cop_ac=1.5,
+                            tau_mass=911 / 34.6, mdot_cp=48)
+    assert "tau_mass" in collapsed.implausible()
+
+
+def test_mass_time_constant_parameterisation_cannot_collapse():
+    """tau_mass is the fitted quantity, so C_mass follows it and stays slow."""
+    m = RCPlant(n_trips=1)
+    with torch.no_grad():
+        m._tau_mass.fill_(-50.0)     # push as hard as the optimiser could
+        m._ua_mass.fill_(-50.0)
+    p = m.params()
+    assert p.tau_mass > 0 and p.c_mass > 0
 
 
 def test_steady_state_power_matches_observed_holding_power():
     """~1.1-1.3 kW holds roughly 22 K in the measured urban trips."""
-    p = PlantParams(**TRUE)
+    p = PlantParams(c_mass=TRUE_C_MASS, **TRUE)
     assert 1000 < p.steady_state_power_w(delta_t=22.0, speed_ms=0.0) < 2000
 
 
@@ -369,3 +390,57 @@ def test_runtime_estimate_scales_with_epochs():
     dear = FitConfig(horizons_s=(120,), epochs_per_stage=100, batch_size=4, progress=False)
     assert estimate_runtime(w, dear) > 3 * estimate_runtime(w, cheap)
     assert estimate_runtime(w, cheap, n_folds=5) > estimate_runtime(w, cheap)
+
+
+# --------------------------------------------------------------------------
+# identifiability: the duct temperature as a second observation
+# --------------------------------------------------------------------------
+
+def test_vent_temperature_reflects_delivered_heat():
+    """T_vent - T_cab must be proportional to Q_del, which is what makes it
+    an observation of the heater path rather than of the cabin."""
+    m = _oracle()
+    state = torch.tensor([[20.0, 20.0, 0.0], [20.0, 20.0, 3500.0]])
+    vent = m.vent_temp(state)
+    assert float(vent[0]) == pytest.approx(20.0)
+    assert float(vent[1] - vent[0]) == pytest.approx(3500.0 / TRUE["mdot_cp"], rel=1e-4)
+
+
+def test_vent_term_enters_the_loss_only_when_observed():
+    from etm.plant.fit import rollout_loss
+    w, oracle = _synthetic_windows(n_windows=4, steps=200, seed=21)
+    assert not w.has_vent
+    bare = float(rollout_loss(oracle, w, vent_weight=0.5))
+
+    with torch.no_grad():
+        state0 = oracle.initial_state(w.y[:, 0], w.u[:, 0, 0])
+        traj = oracle.rollout(state0, w.u, w.trip_idx)
+        w.y_vent = oracle.vent_temp(traj) + 5.0      # deliberately wrong by 5 K
+    assert w.has_vent
+    assert float(rollout_loss(oracle, w, vent_weight=0.5)) > bare
+
+
+def test_plausibility_penalty_is_zero_inside_the_ranges_and_positive_outside():
+    from etm.plant.fit import plausibility_penalty
+    assert float(plausibility_penalty(_oracle())) == pytest.approx(0.0, abs=1e-6)
+    bad = RCPlant(n_trips=1)
+    with torch.no_grad():
+        bad._tau_mass.fill_(-8.0)            # drive the mass time constant to ~0
+    assert float(plausibility_penalty(bad)) > 0.1
+
+
+def test_windows_pick_up_the_duct_temperature_when_present():
+    trips = {"T": _fake_trip("T", 800)}
+    trips["T"]["hx_out_c"] = trips["T"]["cabin_temp_c"] + 30.0
+    w = build_windows(trips, horizon_s=300, stride_s=300)
+    assert w.has_vent
+    assert w.y_vent.shape == w.y.shape
+    assert torch.allclose(w.y_vent - w.y, torch.full_like(w.y, 30.0), atol=1e-3)
+
+
+def test_windows_have_no_duct_temperature_on_the_reduced_summer_schema():
+    """TripA files carry no heat-exchanger or vent channels at all."""
+    w = build_windows({"T": _fake_trip("T", 800)}, horizon_s=300, stride_s=300)
+    assert not w.has_vent
+    assert w.truncate(100).y_vent is None
+    assert w.subset(torch.tensor([True, True])).y_vent is None
