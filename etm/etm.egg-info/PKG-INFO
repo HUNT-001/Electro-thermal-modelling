@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: etm
+Version: 0.1.0
+Summary: Electro-thermal demand forecasting and cabin-heating control for BEVs
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: pyarrow>=14
+Requires-Dist: openpyxl>=3.1
+Requires-Dist: scikit-learn>=1.3
+Provides-Extra: model
+Requires-Dist: xgboost>=2.0; extra == "model"
+Requires-Dist: torch>=2.2; extra == "model"
+Provides-Extra: control
+Requires-Dist: gymnasium>=0.29; extra == "control"
+Requires-Dist: stable-baselines3>=2.2; extra == "control"
+Requires-Dist: cvxpy>=1.4; extra == "control"
+Provides-Extra: track
+Requires-Dist: mlflow>=2.10; extra == "track"
+Requires-Dist: hydra-core>=1.3; extra == "track"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: ruff>=0.4; extra == "dev"
