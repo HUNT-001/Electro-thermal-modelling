@@ -29,6 +29,12 @@ _SOURCE = {
 }
 TARGET_COL = "cabin_temp_c"
 
+#: Delivery-air temperature, in preference order.  Observing this alongside
+#: cabin temperature is what makes the heater efficiency identifiable rather
+#: than confounded with the cabin capacitance.  The reduced summer schemas have
+#: none of these, so it stays optional.
+VENT_COLS = ("hx_out_c", "vent_ctr_r_c", "vent_ctr_l_c", "vent_right_c")
+
 
 @dataclass
 class WindowSet:
@@ -39,6 +45,11 @@ class WindowSet:
     trip_idx: Tensor     # (N,)      index into `trips`
     start_s: Tensor      # (N,)      window start time within its trip
     trips: list[str]
+    y_vent: Tensor | None = None   # (N, T) measured delivery air temperature
+
+    @property
+    def has_vent(self) -> bool:
+        return self.y_vent is not None
 
     def __len__(self) -> int:
         return self.u.shape[0]
@@ -49,16 +60,19 @@ class WindowSet:
 
     def to(self, device: str | torch.device) -> "WindowSet":
         return WindowSet(self.u.to(device), self.y.to(device), self.trip_idx.to(device),
-                         self.start_s, self.trips)
+                         self.start_s, self.trips,
+                         None if self.y_vent is None else self.y_vent.to(device))
 
     def subset(self, mask: np.ndarray | Tensor) -> "WindowSet":
         m = torch.as_tensor(mask)
-        return WindowSet(self.u[m], self.y[m], self.trip_idx[m], self.start_s[m], self.trips)
+        return WindowSet(self.u[m], self.y[m], self.trip_idx[m], self.start_s[m], self.trips,
+                         None if self.y_vent is None else self.y_vent[m])
 
     def truncate(self, horizon: int) -> "WindowSet":
         """Shorten every window -- used by the horizon curriculum during fitting."""
         h = min(horizon, self.horizon)
-        return WindowSet(self.u[:, :h], self.y[:, :h], self.trip_idx, self.start_s, self.trips)
+        return WindowSet(self.u[:, :h], self.y[:, :h], self.trip_idx, self.start_s, self.trips,
+                         None if self.y_vent is None else self.y_vent[:, :h])
 
     def select_trips(self, keep: set[str]) -> "WindowSet":
         idx = {i for i, t in enumerate(self.trips) if t in keep}
@@ -117,12 +131,17 @@ def build_windows(
     stride = max(1, int(round(stride_s / dt_s)))
 
     names = sorted(trips)
-    u_list, y_list, idx_list, start_list = [], [], [], []
+    u_list, y_list, v_list, idx_list, start_list = [], [], [], [], []
+    vent_available = all(any(c in trips[n].columns for c in VENT_COLS) for n in names)
 
     for ti, name in enumerate(names):
         df = trips[name].reset_index(drop=True)
         u_full = _inputs(df)
         y_full = pd.to_numeric(df[TARGET_COL], errors="coerce").to_numpy(dtype=np.float64)
+        v_full = None
+        if vent_available:
+            col = next(c for c in VENT_COLS if c in df.columns)
+            v_full = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
         t_full = pd.to_numeric(df["time_s"], errors="coerce").to_numpy(dtype=np.float64)
         if len(df) < steps:
             continue
@@ -130,17 +149,24 @@ def build_windows(
         for s in range(0, len(df) - steps + 1, stride):
             e = s + steps
             u_w, y_w = u_full[s:e], y_full[s:e]
+            v_w = v_full[s:e] if v_full is not None else None
             miss = np.isnan(u_w).any(axis=-1) | np.isnan(y_w)
+            if v_w is not None:
+                miss = miss | np.isnan(v_w)
             if miss.mean() > max_gap_frac or miss[0]:
                 continue
             if miss.any():
                 good = ~miss
                 grid = np.arange(steps)
                 y_w = np.interp(grid, grid[good], y_w[good])
+                if v_w is not None:
+                    v_w = np.interp(grid, grid[good], v_w[good])
                 u_w = np.stack([np.interp(grid, grid[good], u_w[good, c])
                                 for c in range(u_w.shape[1])], axis=-1)
             u_list.append(u_w)
             y_list.append(y_w)
+            if v_w is not None:
+                v_list.append(v_w)
             idx_list.append(ti)
             start_list.append(t_full[s])
 
@@ -155,4 +181,6 @@ def build_windows(
         trip_idx=torch.tensor(idx_list, dtype=torch.long),
         start_s=torch.tensor(start_list, dtype=torch.float32),
         trips=names,
+        y_vent=(torch.tensor(np.stack(v_list), dtype=torch.float32)
+                if len(v_list) == len(u_list) and v_list else None),
     )
