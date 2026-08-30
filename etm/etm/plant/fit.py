@@ -28,12 +28,13 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor
 
-from .model import RCPlant
+from .model import PLAUSIBLE_RANGES, RCPlant
 from .windows import WindowSet
 
 log = logging.getLogger(__name__)
 
-__all__ = ["FitConfig", "FitResult", "fit_plant", "rollout_loss"]
+__all__ = ["FitConfig", "FitResult", "fit_plant", "rollout_loss",
+           "plausibility_penalty", "estimate_runtime"]
 
 
 @dataclass
@@ -53,6 +54,15 @@ class FitConfig:
     weight_decay: float = 0.0
     grad_clip: float = 1.0
     huber_delta: float = 1.0      # deg C; robust to sensor spikes
+    #: Weight on the delivery-air temperature term.  Non-zero is what separates
+    #: eta from C_cab; too large and the duct sensor's own dynamics start
+    #: dictating the cabin capacitance.
+    vent_weight: float = 0.3
+    #: Soft penalty pulling parameters back inside their plausible ranges.
+    #: Reporting implausibility after the fact is not enough -- the winter run
+    #: drove the interior mass to a 26 s time constant in all five folds and
+    #: still reduced the loss.
+    plausibility_weight: float = 0.05
     device: str = "cpu"
     seed: int = 0
     log_every: int = 20
@@ -74,16 +84,44 @@ class FitResult:
     val_rmse_by_horizon: dict[int, float] = field(default_factory=dict)
 
 
-def rollout_loss(model: RCPlant, w: WindowSet, delta: float = 1.0) -> Tensor:
-    """Huber loss between simulated and measured cabin temperature.
+def plausibility_penalty(model: RCPlant) -> Tensor:
+    """Smooth hinge pulling every parameter back inside its plausible range.
+
+    Scaled in log space so a capacitance and a time constant are penalised
+    comparably.  Zero inside the range, so a well-behaved fit pays nothing.
+    """
+    total = torch.zeros((), device=model._c_cab.device)
+    for name, (lo, hi) in PLAUSIBLE_RANGES.items():
+        v = getattr(model, name)
+        lo_t = torch.as_tensor(lo, device=v.device, dtype=v.dtype)
+        hi_t = torch.as_tensor(hi, device=v.device, dtype=v.dtype)
+        below = torch.clamp(torch.log(lo_t) - torch.log(v.clamp(min=1e-9)), min=0.0)
+        above = torch.clamp(torch.log(v.clamp(min=1e-9)) - torch.log(hi_t), min=0.0)
+        total = total + below ** 2 + above ** 2
+    return total
+
+
+def rollout_loss(model: RCPlant, w: WindowSet, delta: float = 1.0,
+                 vent_weight: float = 0.0, plausibility_weight: float = 0.0) -> Tensor:
+    """Multi-output rollout loss: cabin temperature, plus the delivery air.
 
     Huber rather than MSE because the cabin sensor produces occasional single
     sample spikes; squared error lets one such sample dominate a whole window's
     gradient and drag the fitted capacitance with it.
+
+    When the window set carries a duct temperature it is scored too.  That
+    second output is not a refinement -- without it only ``eta / C_cab`` is
+    identifiable and the fit is free to pick any point along that ridge.
     """
     state0 = model.initial_state(w.y[:, 0], w.u[:, 0, 0])
     traj = model.rollout(state0, w.u, w.trip_idx)
-    return torch.nn.functional.huber_loss(traj[..., 0], w.y, delta=delta)
+    loss = torch.nn.functional.huber_loss(traj[..., 0], w.y, delta=delta)
+    if vent_weight and w.y_vent is not None:
+        loss = loss + vent_weight * torch.nn.functional.huber_loss(
+            model.vent_temp(traj), w.y_vent, delta=delta)
+    if plausibility_weight:
+        loss = loss + plausibility_weight * plausibility_penalty(model)
+    return loss
 
 
 @torch.no_grad()
@@ -143,7 +181,8 @@ def fit_plant(
             for i in range(0, n, cfg.batch_size):
                 batch = stage.subset(perm[i:i + cfg.batch_size].cpu())
                 opt.zero_grad(set_to_none=True)
-                loss = rollout_loss(model, batch, cfg.huber_delta)
+                loss = rollout_loss(model, batch, cfg.huber_delta,
+                                    cfg.vent_weight, cfg.plausibility_weight)
                 if not torch.isfinite(loss):
                     log.warning("non-finite loss at horizon %ds epoch %d; skipping batch",
                                 horizon_s, epoch)
@@ -218,8 +257,8 @@ def transfer_aux(model: RCPlant, n_trips: int) -> RCPlant:
     """
     fresh = RCPlant(n_trips=n_trips, use_residual=model.residual is not None)
     with torch.no_grad():
-        for name in ("_c_cab", "_c_mass", "_ua0", "_ua1", "_ua_mass",
-                     "_eta", "_tau_h", "_cop_ac"):
+        for name in ("_c_cab", "_tau_mass", "_ua0", "_ua1", "_ua_mass",
+                     "_eta", "_tau_h", "_cop_ac", "_mdot_cp"):
             getattr(fresh, name).copy_(getattr(model, name))
         fresh._aux.zero_()
         if model.residual is not None:
