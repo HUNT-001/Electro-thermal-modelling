@@ -117,30 +117,48 @@ them. That test is the difference between "the optimiser reduced a loss" and
 (~15 min on CPU, far less on GPU) and excluded from the default run; use
 `pytest -m slow` for them.
 
-### First result on the 36 development winter trips — the L1 gate is not passed yet
+### Result on the 36 development winter trips
 
 | Horizon | Plant RMSE | Skill vs best baseline |
 |---|---|---|
-| 60 s | 0.580 ± 0.073 °C | **−25.1 %** |
-| 300 s | 2.053 ± 0.396 °C | **−8.8 %** |
+| 60 s | 0.493 ± 0.035 °C | **+8.6 %** |
+| 300 s | 1.885 ± 0.095 °C | **+16.2 %** |
+| 1200 s | 2.906 ± 0.136 °C | **+46.6 %** |
 
-The identified parameters are physically plausible and land close to the
-first-principles estimates (C_cab ≈ 111 kJ/K, UA₀ ≈ 50 W/K, τ_h ≈ 37 s,
-η ≈ 0.85). But the model **loses to persistence**, and the cross-fold spread —
-UA₀ = 49.84 ± 0.80, C_cab = 111 284 ± 87 — is far too tight to be real
-agreement on 40 epochs of training. `movement_from_initial()` exists because of
-this run: parameters that never left their initialisation report perfect
-cross-fold stability while having learned nothing, and that reads as success
-unless something checks for it.
+Positive skill at every horizon, and strongest at 20 minutes — the horizon a
+controller actually plans over. Identified parameters are physically sane:
+C_cab ≈ 125 kJ/K, C_mass ≈ 119 kJ/K, τ_mass ≈ 33 min, UA₀ ≈ 52 W/K,
+τ_h ≈ 33 s, η ≈ 0.92, ṁcp ≈ 67 W/K.
 
-Diagnosis for the next pass, in order of suspicion:
+Getting here took two structural fixes, both prompted by a run that looked
+fine on its loss and was wrong as physics.
 
-1. **Undertrained.** 40 epochs × 2 batches is ~80 optimiser steps per curriculum
-   stage; η did not move at all. Run hundreds on the GPU.
-2. **Windows are dominated by the steady holding phase**, where persistence is
-   unbeatable by construction. Stratify evaluation into warm-up and steady
-   regimes rather than averaging them.
-3. **`Q_aux` is fitted per trip but zeroed at test time.** Honest, but it means
-   the held-out rollout carries whatever bias that term was absorbing.
-4. **The cabin sensor may not measure bulk cabin air** — sited in the vent path
-   it would respond far faster than the modelled state.
+**The interior mass is parameterised by its time constant, not its
+capacitance.** Fitted as `(C_mass, UA_mass)` the pair is degenerate: a 5-fold
+run drove C_mass to ~900 J/K against UA_mass ~35 W/K — a 26 s "thermal mass",
+flagged implausible in all five folds while still reducing the loss. A model
+with no slow storage would let an MPC believe it can dump the cabin's heat and
+get it straight back. `τ_mass` is now the fitted quantity and `C_mass` follows
+from it, and a soft plausibility penalty pulls parameters back inside their
+ranges during fitting rather than only reporting the violation afterwards.
+
+**The duct temperature is a second observed output.** Against cabin
+temperature alone only the *ratio* η/C_cab is identifiable, and the fit proved
+it: three folds landed on (η 0.43, C_cab 50 kJ/K) and two on (η 0.80,
+C_cab 99 kJ/K), fitting about equally well. With a fixed blower the heat
+carried into the cabin is `ṁcp·(T_vent − T_cab)`, so the duct sensor observes
+`Q_del` directly. Measured on the winter trips, `P_heat/(T_duct − T_cab)` has a
+median of 62 W/K on TripB05, 77 on TripB18 and 144 on TripB09 — tight enough
+that `ṁcp` is pinned by its physical range and η becomes separately
+identifiable.
+
+Both fixes together turned 60 s skill from **−14.8 % to +8.6 %** and 1200 s
+from **+39.5 % to +46.6 %**, on roughly a tenth of the training epochs.
+
+### Still open
+
+- **UA₁ ≈ 0.5 W/K per m/s** — the speed dependence of envelope loss is barely
+  identified. Urban winter trips may simply not excite it; the three highway
+  trips (B10, B12, B14) are where to look.
+- **`Q_aux` is fitted per trip but zeroed at test time.** Honest, but the
+  held-out rollout carries whatever bias that term was absorbing.
