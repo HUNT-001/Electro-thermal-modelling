@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+etm/__init__.py
+etm/__main__.py
+etm/cli.py
+etm/ingest.py
+etm/schema.py
+etm/splits.py
+etm.egg-info/PKG-INFO
+etm.egg-info/SOURCES.txt
+etm.egg-info/dependency_links.txt
+etm.egg-info/entry_points.txt
+etm.egg-info/requires.txt
+etm.egg-info/top_level.txt
+tests/test_ingest.py
+tests/test_schema.py
+tests/test_splits.py
