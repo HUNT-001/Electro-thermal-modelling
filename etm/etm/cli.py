@@ -173,6 +173,20 @@ def main(argv: list[str] | None = None) -> int:
     else:
         register_plant(sub)
 
+    try:
+        from .forecast.cli import register as register_forecast
+    except ImportError:
+        pass
+    else:
+        register_forecast(sub)
+
+    try:
+        from .control.cli import register as register_control
+    except ImportError:
+        pass
+    else:
+        register_control(sub)
+
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(message)s")
