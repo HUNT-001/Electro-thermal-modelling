@@ -1,212 +1,159 @@
-# ⚡ Electro-Thermal Power Management for Electric Vehicles
-### Machine Learning-Based Heating Power Prediction — BMW i3 Real-World Dataset
+# Electro-Thermal Modelling — from a heating-power predictor to a cabin-heating controller
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)
-![XGBoost](https://img.shields.io/badge/XGBoost-2Stage-orange?logo=xgboost)
+Predicting, forecasting, and **controlling** the cabin-heating power of a battery EV
+in winter, on the [BMW i3 real-driving dataset][dataset]. The goal is the one an
+energy-management system actually cares about: reach the same cabin comfort the
+production controller achieves, using less heater energy — and therefore more
+winter range.
+
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
+![PyTorch](https://img.shields.io/badge/PyTorch-grey?logo=pytorch)
+![Tests](https://img.shields.io/badge/tests-~110%20passing-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Status](https://img.shields.io/badge/Status-Complete-brightgreen)
+
+> **Status.** The `etm/` package (L0–L3 below) is complete and reproducible.
+> An earlier version of this repo trained a two-stage XGBoost model to predict
+> instantaneous heating power; that work, its corrected results, and why the
+> project was rebuilt are described under *[What changed, and why](#what-changed-and-why)*.
 
 ---
 
-## 🔍 Problem Statement
+## The result in one line
 
-Battery Electric Vehicles (EVs) lose **30–50% driving range in winter** due to cabin heating.
-A BMW i3 heater draws up to **7000W continuously** from the same battery that powers the motor.
+On held-out winter trips, a model-predictive controller acting on a thermal model
+**identified from the data** reaches the production controller's comfort using
+**23.7 % ± 6.3 % less heater energy** — about **+0.6 km of winter range per 20 minutes**
+of driving — and keeps that advantage under ±20 % error in the identified plant.
 
-This project builds a **2-stage machine learning model** that predicts instantaneous heating power
-demand using only vehicle sensor data — no direct heater signal needed.
-The prediction output can feed directly into an **Energy Management System (EMS)** to:
-
-- Pre-schedule battery power for heating vs traction
-- Route regenerative braking energy to the heater
-- Reduce peak battery current and extend battery life
-- Improve winter range estimation accuracy
+This is a **simulation** result, with the limits stated plainly [below](#honest-limits).
+It is built on four layers, each with baselines it has to beat and each reporting
+its own failures rather than only its wins.
 
 ---
 
-## 📊 Dataset
+## The four layers
 
-| Property | Value |
-|---|---|
-| Vehicle | BMW i3 (60 Ah battery) |
-| Routes | Munich area — highway, urban, mixed |
-| Total trips | 70 (TripA = 32 summer, TripB = 38 winter) |
-| Used for model | TripB (38 winter trips) only |
-| Total rows | 627,092 rows after cleaning |
-| Time resolution | 0.1 seconds (10 readings/second) |
-| Target variable | Requested Heating Power [W] — range 0 to 7000W |
-
-### Signal Categories
-
-| Category | Signals |
-|---|---|
-| Environmental | Ambient temperature, Elevation |
-| Vehicle Dynamics | Velocity, Motor torque, Throttle, Acceleration, Regen signal |
-| Battery | Voltage, Current, Temperature, SoC |
-| Thermal Circuit | Cabin temp, Coolant temps, Heat exchanger temp, Requested coolant temp |
-
----
-
-## 🏗️ Model Architecture
-
-A **2-Stage XGBoost Pipeline** was used to handle the zero-inflated heating target:
-
-```
-INPUT: 31 sensor features (per timestep)
-            │
-   ┌─────────▼──────────┐
-   │   STAGE 1          │
-   │  XGBClassifier     │   → Is the heater ON or OFF?
-   │  (Idle vs Active)  │
-   └──────┬───────┬─────┘
-     OFF  │       │  ON
-   ┌──────▼─┐   ┌─▼────────────────────┐
-   │  0W    │   │  STAGE 2             │
-   └────────┘   │  XGBRegressor        │   → How many Watts?
-                │  (Active rows only)  │
-                └─────────┬────────────┘
-                    Predicted Power (W)
-                    rounded to 40W steps
-```
-
-**Why 2-stage?**
-A single regressor struggles when most rows have `target = 0W` (idle) and active rows range
-from 1000W–7000W. Separating idle detection from power regression solves this cleanly.
-
----
-
-## ⚙️ Feature Engineering
-
-From 48 raw CSV columns, **31 final features** were used after:
-- Removing 1 target column, 1 time index, 5 leakage columns, 1 duplicate
-- Engineering 10 new physical features
-- Selecting top 40 by correlation, removing near-duplicates (>99.3% correlated)
-
-### Key Engineered Features
-
-| Feature | Formula | Physical Meaning |
-|---|---|---|
-| `f_cabin_ambient_dt` | Cabin temp − Ambient temp | How warm cabin is vs outside |
-| `f_coolant_req_dt` | Requested coolant − Heatercore actual | Heating deficit in coolant circuit |
-| `f_warmup_needed` | max(0, 20 − Ambient temp) | Degrees below comfort threshold |
-| `f_battery_cold` | max(0, 15 − Battery temp) | Battery cold stress |
-| `f_battery_power_w` | Voltage × Current | Total battery power draw |
-| `f_cabin_coolant_dt` | Requested coolant − Cabin temp | Temperature gap to reach comfort |
-
-### Removed Leakage Columns
-
-| Column | Reason |
-|---|---|
-| Heating Power CAN / LIN | Alternate versions of the target |
-| Heater Voltage / Current | Only present when heater is ON — reveals the answer |
-| Heater Signal | Binary flag directly encoding heater state |
-
----
-
-## 📈 Results
-
-### Train / Validation / Test Split
-Data was split at the **trip level** (not row level) to ensure the model is tested on
-entire trips it never saw during training.
-
-| Split | Trips | Rows |
-|---|---|---|
-| Train | 26 trips | 402,241 |
-| Validation | 6 trips | 115,487 |
-| Test | 6 trips | 109,364 |
-
-### Final Performance Metrics
-
-| Metric | Train | Validation | Test |
+| Layer | What it does | Headline | Beats |
 |---|---|---|---|
-| **R² Score (all rows)** | 97.35% | 83.30% | 73.62% |
-| **R² Score (active only)** | 97.26% | 82.99% | **80.30%** |
-| **MAE — active rows** | 143W | 315W | **303W** |
-| **RMSE** | 218W | 445W | 604W |
-| **MAE as % of full scale** | 2.04% | 4.48% | **4.32%** |
-| **Idle Detection Accuracy** | — | **99.93%** | 87.27% |
-| **Idle Detection F1** | — | **99.93%** | 83.56% |
+| **L0 · Data** | Canonical schema + ingest that fixes every defect in the raw CSVs; day/session-grouped CV; cold hold-out | 70 trips, 4 instrumentation variants, all quirks handled once | — |
+| **L1 · Plant** | Differentiable grey-box RC cabin thermal model, identified by multi-step rollout loss | 20-min warm-up predicted to **~2.8 °C RMSE**, **+54–70 % skill** | persistence, exponential-decay |
+| **L2 · Forecast** | Probabilistic multi-horizon demand forecast with calibrated intervals | **+24–51 %** skill at 60–900 s; interval coverage 0.74–0.83 after conformal | persistence, warm-up curve |
+| **L3 · Control** | MPC by gradient descent through the L1 plant | **+23.7 %** energy saved at OEM-equivalent comfort | OEM policy, thermostat, PI |
 
-> Full scale = 0–7000W. Active rows = rows where heating demand > 120W.
-
-### Key Plots
-
-| Plot | Description |
-|---|---|
-| `plots/00_summary_dashboard.png` | All metrics in one presentation-ready image |
-| `plots/04_actual_vs_pred_test.png` | Actual vs predicted scatter — test trips |
-| `plots/06_metrics_comparison.png` | R², RMSE, MAE bar charts across splits |
-| `plots/09_feature_importance.png` | Top 20 features for classifier and regressor |
-| `plots/11_sample_trip_timeseries.png` | Actual vs predicted over time for 3 trips |
+Each layer is a package under `etm/` with its own CLI subcommand and test suite.
+Full technical detail, per-fold numbers, and the reasoning behind every design
+choice live in **[`etm/README.md`](etm/README.md)**.
 
 ---
 
-## 🗂️ Repository Structure
+## Quickstart
 
-```
-Electro-thermal-modelling/
-├── scripts/
-│   └── tripB_only_final_plots.py     # Complete pipeline — loads, trains, evaluates, plots
-├── outputs/
-│   ├── final_metrics.csv             # All numeric results
-│   ├── selected_features.csv         # 31 features used with importance scores
-│   ├── classifier_stats.csv          # Idle/active F1 and accuracy
-│   ├── split_summary.csv             # Trip count per split
-│   └── run_summary.json              # Full run config and results
-├── plots/                            # 14 publication-ready graphs
-│   ├── 00_summary_dashboard.png
-│   ├── 01_target_distribution.png
-│   └── ...
-├── models/
-│   └── tripB_2stage_model.joblib     # Saved model — ready to deploy
-├── .gitignore
-└── README.md
-```
-
----
-
-## 🚀 How to Run
-
-### Install dependencies
 ```bash
-pip install xgboost scikit-learn pandas numpy matplotlib seaborn joblib
+cd etm
+pip install -e ".[dev,model,control]"
+
+# 1. parse the raw CSVs into a canonical parquet store (fixes the data defects)
+python -m etm ingest --root ".." --out data/processed
+python -m etm audit  --out data/processed          # what the data will and won't support
+
+# 2. identify the cabin thermal plant (L1)
+python -m etm fit-plant --epochs 200 150 100 60 --folds 5
+
+# 3. forecast heating demand with calibrated intervals (L2)
+python -m etm forecast --folds 5
+
+# 4. run MPC vs the OEM / thermostat / PI baselines, with a robustness sweep (L3)
+python -m etm control --n-trips 8 --robustness
+
+pytest        # ~110 tests
 ```
 
-### Run the full pipeline
-```bash
-python scripts/tripB_only_final_plots.py
-```
-
-This will:
-1. Load all 38 TripB CSV files from `E:\IML\measurement\`
-2. Clean data, remove leakage columns, engineer features
-3. Split trips into train/validation/test
-4. Train Stage 1 classifier + Stage 2 regressor with early stopping
-5. Export all metrics, predictions, graphs, and saved model
-
-> **Note:** Raw CSV data files are not included in this repo due to size.
-> Update `DATA_DIR` and `OUTPUT_DIR` in the script to match your local paths.
-
-### Load saved model for inference
-```python
-import joblib
-import pandas as pd
-
-bundle = joblib.load("models/tripB_2stage_model.joblib")
-clf, reg, imp = bundle["clf"], bundle["reg"], bundle["imputer"]
-features = bundle["features"]
-
-# X_new = your new sensor data as a DataFrame
-X_new_imputed = pd.DataFrame(imp.transform(X_new[features]), columns=features)
-
-# Predict
-prob = clf.predict_proba(X_new_imputed)[:, 1]
-import numpy as np
-pred = np.zeros(len(X_new_imputed))
-active = prob >= 0.5
-pred[active] = np.expm1(reg.predict(X_new_imputed.iloc[np.where(active)[0]]))
-pred = np.clip(np.round(pred / 40) * 40, 0, 7000)
-print("Predicted heating power (W):", pred)
-```
+The raw measurement and simulation CSVs are not redistributed here (size, and the
+[dataset's own terms][dataset]); point `--root` at your local copy.
 
 ---
+
+## What changed, and why
+
+The original model predicted instantaneous heating power, `P(t)`, from the vehicle's
+sensors at time `t`, using a two-stage XGBoost classifier + regressor. Re-examining
+it turned up four things worth correcting, and they are the reason for the rebuild:
+
+- **The headline was a single split.** Re-run as 6-fold cross-validation, that model
+  scores **R² = 0.83 ± 0.11**, not the reported 0.736 (an unlucky fold) or 0.833
+  (a lucky one). The spread is the result.
+- **The idle-detection stage doesn't work.** "Heater off" exists in essentially
+  **two** of the 38 winter trips — both fast-charging stops — so the classifier's
+  cross-validated F1 is 0.45–0.51, not the reported 0.99. It was learning two events.
+- **A predictor is not a controller.** `P(t)` from sensors at `t` is a *soft sensor*:
+  by the time you know the answer, the energy is spent. Scheduling battery power
+  needs a *forecast* (L2) and a *plant model* (L1) to optimise a *controller* against
+  (L3). That is the whole point of the rebuild.
+- **The dataset is narrower than it looks.** One vehicle, one city, a single 22 °C
+  setpoint, ambient only −3…+9 °C, and **35 driving sessions** — not 627 k independent
+  samples, because 10 Hz rows an hour apart are not independent. Every result here is
+  reported against that reality.
+
+The rebuild keeps the good parts of the original (the dataset choice, the physical
+feature intuition) and rebuilds the rest as a tested, honest, layered package.
+
+---
+
+## Honest limits
+
+Stated up front, because the credibility of the rest depends on it:
+
+- **L3 is a simulation study.** A recorded trip cannot be re-driven with a different
+  heater policy, so the controllers act on the L1 plant. Internal validity is good —
+  every controller faces the *same* plant, so model error largely cancels in the
+  comparison, and the ±20 % robustness sweep shows the ranking is stable — but the
+  plant's ~2.9 °C cabin RMSE is large next to a 1 °C comfort band, so external validity
+  is the open question. The one measured bias runs *against* the controller (simulation
+  flatters the OEM), so 23.7 % is if anything conservative.
+- **Speed-dependent heat loss (`UA₁`) is not yet identified** — only three highway trips
+  carry the excitation. Motorway-trip savings are the least trustworthy until this is fixed.
+- **The OEM controller optimises more than cabin air temperature** — demisting, humidity,
+  vent-level comfort — which this cost function does not model. "Beating" it on cabin
+  temperature alone is not beating it at its full job.
+- **Single setpoint, mild winter.** Nothing here supports a claim about other cabin
+  setpoints or the sub-zero temperatures where EV range loss actually bites.
+
+---
+
+## Roadmap
+
+- [x] **L0** Data platform, quality audit, grouped CV
+- [x] **L1** Grey-box thermal plant, identified and gated
+- [x] **L2** Probabilistic demand forecaster with conformal calibration
+- [x] **L3** MPC vs OEM/thermostat/PI, with a robustness sweep
+- [ ] **Fix `UA₁`** so motorway heat loss — and every claim that depends on it — is valid
+- [ ] **Safety supervisor** — hard actuator limits, out-of-distribution flag, deterministic
+  fallback to the OEM controller: the piece an OEM would need to evaluate this
+- [ ] **RL comparison arm** (SAC / offline RL) against the same environment and baselines
+- [ ] **Production surface** — config, tracking, ONNX export, embedded-latency budget
+
+---
+
+## Repository layout
+
+```
+etm/                     the rebuilt package — install and run from here
+  etm/schema.py, ingest.py, splits.py     L0 data platform
+  etm/plant/                              L1 grey-box thermal model
+  etm/forecast/                           L2 probabilistic demand forecaster
+  etm/control/                            L3 MPC and the controller comparison
+  tests/                                  ~110 tests, each pinned to a real behaviour
+  README.md                               full technical detail and per-fold results
+scripts/                 the original two-stage XGBoost pipeline (kept for reference)
+Measurement Data/        raw BMW i3 trips (not redistributed)
+Simulation Data/         companion physics-simulation runs (−10 °C, unused by L1–L3 so far)
+```
+
+## Dataset & licence
+
+Measurements and simulation runs: *Battery and Heating Data in Real Driving Cycles*,
+BMW i3 (60 Ah), M. Steinstraeter et al., TU Munich, published on
+[IEEE DataPort][dataset] — see the dataset page for its own terms.
+Code in this repository is released under the MIT licence.
+
+[dataset]: https://ieee-dataport.org/open-access/battery-and-heating-data-real-driving-cycles
