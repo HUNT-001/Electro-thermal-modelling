@@ -40,8 +40,11 @@ def cmd_fit_plant(args) -> int:
           f"cold hold-out: {cold or 'none present'}")
 
     windows = build_windows({k: trips[k] for k in dev_trips},
-                            horizon_s=args.horizon, stride_s=args.stride)
-    print(f"windows: {len(windows)} x {windows.horizon}s from {len(windows.trips)} trips")
+                            horizon_s=args.horizon, stride_s=args.stride,
+                            burn_in_s=args.burn_in, anchor=args.anchor)
+    print(f"windows: {len(windows)} x {windows.horizon}s scored "
+          f"(+{windows.burn_in}s burn-in) from {len(windows.trips)} trips"
+          f"{'  with duct temperature' if windows.has_vent else ''}")
 
     epochs = args.epochs[0] if len(args.epochs) == 1 else tuple(args.epochs)
     if not isinstance(epochs, int) and len(epochs) != len(args.curriculum):
@@ -82,8 +85,11 @@ def cmd_fit_plant(args) -> int:
             print(f"  {p}")
             if p.implausible():
                 print(f"  IMPLAUSIBLE: {p.implausible()}")
+            if res.frozen:
+                print(f"  NOT IDENTIFIED, held at initial value: {', '.join(res.frozen)}")
             moved = res.model.movement_from_initial()
-            stuck = {k: v for k, v in moved.items() if v < 0.05}
+            stuck = {k: v for k, v in moved.items()
+                     if v < 0.05 and k not in res.frozen}
             if stuck:
                 print("  BARELY MOVED from initialisation (undertrained or unexcited): "
                       + ", ".join(f"{k} {v:+.1%}" for k, v in sorted(stuck.items())))
@@ -143,6 +149,17 @@ def cmd_eval_plant(args) -> int:
     return 0
 
 
+def cmd_identify_ua(args) -> int:
+    from .steady_state import identify_ua_steady_state
+    trips, _ = _load(args)
+    res = identify_ua_steady_state(trips)
+    print(res.summary())
+    if not res.speed_dependence_detected:
+        print("\n  UA1 is frozen at zero in the plant model on this evidence, not fitted.")
+        print("  A fresh-air-intake mode, or speeds beyond those covered, would need it restored.")
+    return 0
+
+
 def register(sub) -> None:
     common = dict()
     pf = sub.add_parser("fit-plant", help="identify the grey-box cabin thermal model")
@@ -152,6 +169,14 @@ def register(sub) -> None:
                     help="winter trips by default; the summer schemas lack the coolant circuit")
     pf.add_argument("--horizon", type=int, default=1200, help="window length in seconds")
     pf.add_argument("--stride", type=int, default=300)
+    pf.add_argument("--anchor", choices=("trip_start", "sliding"), default="trip_start",
+                    help="'trip_start' takes one window from key-on per trip, where the "
+                         "interior temperature is known (both at ambient after a soak); "
+                         "'sliding' covers more of each trip but starts from an "
+                         "unobservable interior state")
+    pf.add_argument("--burn-in", type=int, default=0,
+                    help="seconds simulated but not scored, so the latent states settle "
+                         "before the model is judged; 0 reproduces the old behaviour")
     pf.add_argument("--curriculum", type=int, nargs="+", default=[120, 300, 600, 1200])
     pf.add_argument("--epochs", type=int, nargs="+", default=[60],
                     help="one value for every stage, or one per curriculum stage "
@@ -168,6 +193,12 @@ def register(sub) -> None:
                     help="print the projected runtime and exit without fitting")
     pf.add_argument("--quiet", action="store_true", help="suppress the progress line")
     pf.set_defaults(func=cmd_fit_plant)
+
+    pu = sub.add_parser("identify-ua",
+                        help="steady-state heat-balance check of the speed-dependent envelope loss")
+    pu.add_argument("--processed", default="data/processed")
+    pu.add_argument("--pattern", default="TripB*.parquet")
+    pu.set_defaults(func=cmd_identify_ua)
 
     pe = sub.add_parser("eval-plant", help="score a saved plant against baselines")
     pe.add_argument("--model", required=True)

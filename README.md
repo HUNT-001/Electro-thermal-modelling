@@ -110,8 +110,11 @@ Stated up front, because the credibility of the rest depends on it:
   plant's ~2.9 °C cabin RMSE is large next to a 1 °C comfort band, so external validity
   is the open question. The one measured bias runs *against* the controller (simulation
   flatters the OEM), so 23.7 % is if anything conservative.
-- **Speed-dependent heat loss (`UA₁`) is not yet identified** — only three highway trips
-  carry the excitation. Motorway-trip savings are the least trustworthy until this is fixed.
+- **Speed-dependent heat loss (`UA₁`) is ~0 — now shown to be a property of the car, not a
+  data gap.** A direct heat-balance regression (`python -m etm identify-ua`) has three
+  independent estimators agreeing on zero: the i3 heats recirculated air once warm, so
+  envelope loss is conduction-dominated and does not scale with road speed. This is valid
+  to ~42 m/s; a fresh-air-intake mode or higher speeds would need the term restored.
 - **The OEM controller optimises more than cabin air temperature** — demisting, humidity,
   vent-level comfort — which this cost function does not model. "Beating" it on cabin
   temperature alone is not beating it at its full job.
@@ -126,9 +129,10 @@ Stated up front, because the credibility of the rest depends on it:
 - [x] **L1** Grey-box thermal plant, identified and gated
 - [x] **L2** Probabilistic demand forecaster with conformal calibration
 - [x] **L3** MPC vs OEM/thermostat/PI, with a robustness sweep
-- [ ] **Fix `UA₁`** so motorway heat loss — and every claim that depends on it — is valid
-- [ ] **Safety supervisor** — hard actuator limits, out-of-distribution flag, deterministic
-  fallback to the OEM controller: the piece an OEM would need to evaluate this
+- [x] **`UA₁` resolved** — a direct heat-balance regression shows the ~0 speed dependence is
+  a physical property of the recirculating cabin, not missing data (`etm identify-ua`)
+- [x] **Safety supervisor** — hard actuator limits, out-of-distribution flag, deterministic
+  fallback to the OEM controller: the piece an OEM would need to evaluate this (`--supervised`)
 - [ ] **RL comparison arm** (SAC / offline RL) against the same environment and baselines
 - [ ] **Production surface** — config, tracking, ONNX export, embedded-latency budget
 

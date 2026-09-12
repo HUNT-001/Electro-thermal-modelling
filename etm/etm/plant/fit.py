@@ -82,6 +82,52 @@ class FitResult:
     model: RCPlant
     history: list[dict] = field(default_factory=list)
     val_rmse_by_horizon: dict[int, float] = field(default_factory=dict)
+    #: Parameters held at their initial value because nothing in the data
+    #: could constrain them.
+    frozen: list[str] = field(default_factory=list)
+
+
+def unidentifiable(w: WindowSet, min_active_frac: float = 0.02) -> set[str]:
+    """Parameters whose input is never meaningfully exercised in these windows.
+
+    The A/C compressor runs in 0-6 % of winter rows and averages a few watts,
+    so ``cop_ac`` has almost no gradient -- and a 660-epoch run duly drifted it
+    to 6.0-7.3, above any physical COP, while the loss barely noticed.  A
+    number fitted with no information in it is worse than no number: it looks
+    like a result.  Freezing it and saying so is the honest option.
+    """
+    out: set[str] = set()
+    if float((w.u[..., 1].abs() > 50.0).float().mean()) < min_active_frac:
+        out.add("cop_ac")
+    # UA1 is the speed dependence of envelope loss, and on this dataset it is
+    # not merely unexcited but genuinely ~zero: a steady-state heat-balance
+    # regression across all 38 winter trips (see etm.plant.steady_state) puts it
+    # at +0.007 W/K per m/s with per-trip fixed effects, and the within-trip
+    # correlation between speed and loss is ~0.05.  The i3 recirculates cabin
+    # air once warm, so envelope loss is conduction-dominated and speed-
+    # insensitive.  Freeze UA1 unless a window actually pairs sustained high
+    # speed with a warm cabin -- which no trip_start window does -- and let the
+    # `etm identify-ua` diagnostic be the record of why.
+    per_window_hi = (w.u[..., 3] > 20.0).float().mean(dim=1)     # frac above 72 km/h
+    if float(per_window_hi.max()) < 0.15:
+        out.add("ua1")
+    return out
+
+
+def _simulate(model: RCPlant, w: WindowSet):
+    """Roll the model over the scored part of every window.
+
+    With a burn-in the latent states are estimated from the measured prefix
+    (see :meth:`RCPlant.initial_state_from_history`) and the rollout starts at
+    the end of it; without one they fall back to the cold-start guess.
+    """
+    b = w.burn_in
+    if b:
+        state0 = model.initial_state_from_history(w.y[:, :b], w.u[:, :b])
+    else:
+        state0 = model.initial_state(w.y[:, 0], w.u[:, 0, 0])
+    traj = model.rollout(state0, w.u[:, b:], w.trip_idx)
+    return traj, w.y[:, b:], None if w.y_vent is None else w.y_vent[:, b:]
 
 
 def plausibility_penalty(model: RCPlant) -> Tensor:
@@ -113,12 +159,11 @@ def rollout_loss(model: RCPlant, w: WindowSet, delta: float = 1.0,
     second output is not a refinement -- without it only ``eta / C_cab`` is
     identifiable and the fit is free to pick any point along that ridge.
     """
-    state0 = model.initial_state(w.y[:, 0], w.u[:, 0, 0])
-    traj = model.rollout(state0, w.u, w.trip_idx)
-    loss = torch.nn.functional.huber_loss(traj[..., 0], w.y, delta=delta)
-    if vent_weight and w.y_vent is not None:
+    traj, y, y_vent = _simulate(model, w)
+    loss = torch.nn.functional.huber_loss(traj[..., 0], y, delta=delta)
+    if vent_weight and y_vent is not None:
         loss = loss + vent_weight * torch.nn.functional.huber_loss(
-            model.vent_temp(traj), w.y_vent, delta=delta)
+            model.vent_temp(traj), y_vent, delta=delta)
     if plausibility_weight:
         loss = loss + plausibility_weight * plausibility_penalty(model)
     return loss
@@ -128,9 +173,8 @@ def rollout_loss(model: RCPlant, w: WindowSet, delta: float = 1.0,
 def rollout_rmse(model: RCPlant, w: WindowSet, horizon: int | None = None) -> float:
     """Open-loop RMSE (deg C) of cabin temperature over the window."""
     ws = w.truncate(horizon) if horizon else w
-    state0 = model.initial_state(ws.y[:, 0], ws.u[:, 0, 0])
-    traj = model.rollout(state0, ws.u, ws.trip_idx)
-    return float(torch.sqrt(torch.mean((traj[..., 0] - ws.y) ** 2)))
+    traj, y, _ = _simulate(model, ws)
+    return float(torch.sqrt(torch.mean((traj[..., 0] - y) ** 2)))
 
 
 def fit_plant(
@@ -156,13 +200,22 @@ def fit_plant(
     train = train.to(device)
     val = val.to(device) if val is not None else None
 
-    physical = [p for n, p in model.named_parameters() if not n.startswith("residual")]
+    frozen = unidentifiable(train)
+    for name in frozen:
+        getattr(model, f"_{name}").requires_grad_(False)
+    if frozen and cfg.progress:
+        print(f"    frozen (input never excited in this fold): {', '.join(sorted(frozen))}",
+              file=sys.stderr, flush=True)
+    result_frozen = frozen
+
+    physical = [p for n, p in model.named_parameters()
+                if not n.startswith("residual") and p.requires_grad]
     groups = [{"params": physical, "lr": cfg.lr}]
     if model.residual is not None:
         groups.append({"params": model.residual.parameters(), "lr": cfg.lr_residual})
     opt = torch.optim.Adam(groups, weight_decay=cfg.weight_decay)
 
-    result = FitResult(model=model)
+    result = FitResult(model=model, frozen=sorted(result_frozen))
     n = len(train)
     n_batches = max(1, -(-n // cfg.batch_size))
     total_units = sum(min(h, train.horizon) * cfg.epochs_for(h) * n_batches

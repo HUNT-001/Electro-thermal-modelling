@@ -297,7 +297,7 @@ def _fake_trip(name, n=1000, seed=0):
 def test_windows_never_straddle_two_trips():
     trips = {"TripB01": _fake_trip("TripB01", 1000),
              "TripB02": _fake_trip("TripB02", 1000, seed=1)}
-    w = build_windows(trips, horizon_s=300, stride_s=150)
+    w = build_windows(trips, horizon_s=300, stride_s=150, burn_in_s=0)
     assert len(w) > 0
     assert w.horizon == 300
     assert set(w.trips) == {"TripB01", "TripB02"}
@@ -306,7 +306,7 @@ def test_windows_never_straddle_two_trips():
 
 def test_velocity_is_converted_to_metres_per_second():
     trips = {"T": _fake_trip("T", 400)}
-    w = build_windows(trips, horizon_s=300, stride_s=300)
+    w = build_windows(trips, horizon_s=300, stride_s=300, burn_in_s=0)
     kmh = trips["T"]["velocity_kmh"].to_numpy()[:300]
     assert np.allclose(w.u[0, :, 3].numpy(), kmh / 3.6, atol=1e-4)
 
@@ -315,7 +315,7 @@ def test_windows_with_large_gaps_are_dropped_not_imputed():
     """Filling a hole in the heater trace invents energy that never entered the cabin."""
     df = _fake_trip("T", 900)
     df.loc[100:280, "heat_power_req_w"] = np.nan      # 60% of the first window
-    w = build_windows({"T": df}, horizon_s=300, stride_s=300, max_gap_frac=0.02)
+    w = build_windows({"T": df}, horizon_s=300, stride_s=300, max_gap_frac=0.02, burn_in_s=0)
     starts = w.start_s.tolist()
     assert 0.0 not in starts, "window over the gap should have been dropped"
     assert starts == [300.0, 600.0]
@@ -325,26 +325,26 @@ def test_window_starting_on_a_missing_sample_is_dropped():
     """A rollout cannot begin from an unknown state, however small the gap."""
     df = _fake_trip("T", 900)
     df.loc[300, "heat_power_req_w"] = np.nan
-    w = build_windows({"T": df}, horizon_s=300, stride_s=300, max_gap_frac=0.5)
+    w = build_windows({"T": df}, horizon_s=300, stride_s=300, max_gap_frac=0.5, burn_in_s=0)
     assert 300.0 not in w.start_s.tolist()
 
 
 def test_small_gaps_are_interpolated_and_the_window_kept():
     df = _fake_trip("T", 900)
     df.loc[150:151, "heat_power_req_w"] = np.nan      # <2% of the window
-    w = build_windows({"T": df}, horizon_s=300, stride_s=300, max_gap_frac=0.02)
+    w = build_windows({"T": df}, horizon_s=300, stride_s=300, max_gap_frac=0.02, burn_in_s=0)
     assert 0.0 in w.start_s.tolist()
     assert torch.isfinite(w.u).all()
 
 
 def test_short_trips_produce_no_windows_rather_than_padding():
     with pytest.raises(ValueError, match="no windows"):
-        build_windows({"T": _fake_trip("T", 100)}, horizon_s=1200)
+        build_windows({"T": _fake_trip("T", 100)}, horizon_s=1200, burn_in_s=0)
 
 
 def test_select_trips_filters_windows():
     trips = {"A": _fake_trip("A", 800), "B": _fake_trip("B", 800, seed=2)}
-    w = build_windows(trips, horizon_s=300, stride_s=200)
+    w = build_windows(trips, horizon_s=300, stride_s=200, burn_in_s=0)
     only_a = w.select_trips({"A"})
     assert len(only_a) < len(w)
     assert set(only_a.trip_idx.tolist()) == {w.trips.index("A")}
@@ -432,7 +432,7 @@ def test_plausibility_penalty_is_zero_inside_the_ranges_and_positive_outside():
 def test_windows_pick_up_the_duct_temperature_when_present():
     trips = {"T": _fake_trip("T", 800)}
     trips["T"]["hx_out_c"] = trips["T"]["cabin_temp_c"] + 30.0
-    w = build_windows(trips, horizon_s=300, stride_s=300)
+    w = build_windows(trips, horizon_s=300, stride_s=300, burn_in_s=0)
     assert w.has_vent
     assert w.y_vent.shape == w.y.shape
     assert torch.allclose(w.y_vent - w.y, torch.full_like(w.y, 30.0), atol=1e-3)
@@ -440,7 +440,239 @@ def test_windows_pick_up_the_duct_temperature_when_present():
 
 def test_windows_have_no_duct_temperature_on_the_reduced_summer_schema():
     """TripA files carry no heat-exchanger or vent channels at all."""
-    w = build_windows({"T": _fake_trip("T", 800)}, horizon_s=300, stride_s=300)
+    w = build_windows({"T": _fake_trip("T", 800)}, horizon_s=300, stride_s=300, burn_in_s=0)
     assert not w.has_vent
     assert w.truncate(100).y_vent is None
     assert w.subset(torch.tensor([True, True])).y_vent is None
+
+
+# --------------------------------------------------------------------------
+# burn-in: the latent states are guessed, so don't score the guess
+# --------------------------------------------------------------------------
+
+def test_burn_in_is_simulated_but_not_scored():
+    trips = {"T": _fake_trip("T", 1200)}
+    w = build_windows(trips, horizon_s=600, stride_s=600, burn_in_s=200)
+    assert w.burn_in == 200
+    assert w.horizon == 600                 # scored length
+    assert w.u.shape[1] == 800              # simulated length
+    assert w.y[:, w.scored].shape[1] == 600
+
+
+def test_truncate_keeps_the_burn_in_prefix():
+    """Shortening to a 60 s horizon must not throw away the settling period."""
+    trips = {"T": _fake_trip("T", 1200)}
+    w = build_windows(trips, horizon_s=600, stride_s=600, burn_in_s=200)
+    t = w.truncate(60)
+    assert t.burn_in == 200
+    assert t.horizon == 60
+    assert t.u.shape[1] == 260
+
+
+def test_observer_recovers_the_fast_state_but_not_the_slow_one():
+    """The result that sent L1 to trip-start anchoring.
+
+    Running an observer over measured history nails Q_del, whose 45 s time
+    constant lets it forget its initial value, and cannot recover T_mass, whose
+    25 min time constant means five minutes of history carries almost no
+    information about it. No initialisation trick fixes an unobservable state;
+    only starting where the state is known does.
+    """
+    from etm.plant.windows import WindowSet
+    oracle = _oracle()
+    u = _excited_inputs(6, 1200, seed=31)
+    idx = torch.zeros(6, dtype=torch.long)
+    with torch.no_grad():
+        state0 = torch.stack([torch.full((6,), 5.0), torch.full((6,), 20.0),
+                              torch.zeros(6)], dim=-1)
+        traj = oracle.rollout(state0, u, idx)
+        y = traj[..., 0]
+        est = oracle.initial_state_from_history(y[:, :300], u[:, :300])
+
+    assert float(est[0, 2]) == pytest.approx(float(traj[0, 299, 2]), rel=0.01)
+    assert abs(float(est[0, 1]) - float(traj[0, 299, 1])) > 5.0
+
+    # and consequently a mid-trip window scores worse than one anchored where
+    # the interior state is genuinely known
+    mid = WindowSet(u=u, y=y, trip_idx=idx, start_s=torch.zeros(6),
+                    trips=["t"], burn_in=300)
+    assert rollout_rmse(oracle, mid, 300) > 0.0
+
+
+def test_initial_state_from_history_recovers_a_lagging_interior():
+    """T_mass is estimated as an EWMA of measured cabin temperature over
+    roughly tau_mass, because the interior soaks toward where the air has been."""
+    m = _oracle()
+    b = 900
+    y_hist = torch.full((1, b), 10.0)
+    y_hist[:, b // 2:] = 25.0              # cabin stepped up halfway through
+    u_hist = torch.zeros(1, b, 4)
+    state = m.initial_state_from_history(y_hist, u_hist)
+    t_cab0, t_mass0, q_del0 = state[0]
+    assert float(t_cab0) == pytest.approx(25.0)      # cabin is measured
+    assert 10.0 < float(t_mass0) < 25.0              # interior lags behind it
+    assert float(q_del0) == pytest.approx(0.0, abs=1e-3)
+
+
+def test_initial_state_from_history_settles_the_heater_lag():
+    """Q_del has a short time constant, so running it through the history
+    lands it on the steady value regardless of where it started."""
+    m = _oracle()
+    b = 600
+    u_hist = torch.zeros(1, b, 4)
+    u_hist[..., 0] = 6000.0
+    state = m.initial_state_from_history(torch.full((1, b), 20.0), u_hist)
+    assert float(state[0, 2]) == pytest.approx(TRUE["eta"] * 6000.0, rel=0.02)
+
+
+def test_unidentifiable_freezes_cop_when_the_compressor_never_runs():
+    """A/C is active in 0-6 % of winter rows; a COP fitted from that is noise."""
+    from etm.plant.fit import unidentifiable
+    w, _ = _synthetic_windows(n_windows=4, steps=300, seed=41)   # p_ac is all zeros
+    assert "cop_ac" in unidentifiable(w)
+
+    w.u[..., 1] = 1200.0
+    assert "cop_ac" not in unidentifiable(w)
+
+
+def test_unidentifiable_freezes_speed_term_without_speed_variation():
+    from etm.plant.fit import unidentifiable
+    w, _ = _synthetic_windows(n_windows=4, steps=300, seed=42)
+    w.u[..., 3] = 10.0                       # constant speed: UA1 unconstrained
+    assert "ua1" in unidentifiable(w)
+
+
+def test_frozen_parameters_do_not_move_during_fitting():
+    w, _ = _synthetic_windows(n_windows=4, steps=200, seed=43)
+    cfg = FitConfig(horizons_s=(120,), epochs_per_stage=15, batch_size=4, progress=False)
+    res = fit_plant(w, cfg=cfg)
+    assert "cop_ac" in res.frozen
+    assert res.model.params().cop_ac == pytest.approx(RCPlant.INITIAL["cop_ac"], rel=1e-4)
+
+
+def test_trip_start_anchor_gives_one_window_per_trip_from_key_on():
+    """At key-on the interior and the cabin air are both at ambient -- the one
+    moment the unobservable slow state is actually known."""
+    trips = {"A": _fake_trip("A", 3000), "B": _fake_trip("B", 3000, seed=5)}
+    w = build_windows(trips, horizon_s=1200, anchor="trip_start", burn_in_s=0)
+    assert len(w) == 2
+    assert w.start_s.tolist() == [0.0, 0.0]
+    assert sorted(w.trip_idx.tolist()) == [0, 1]
+
+
+def test_trip_start_anchor_skips_trips_shorter_than_the_horizon():
+    trips = {"A": _fake_trip("A", 3000), "SHORT": _fake_trip("SHORT", 400, seed=6)}
+    w = build_windows(trips, horizon_s=1200, anchor="trip_start", burn_in_s=0)
+    assert len(w) == 1
+    assert w.trips[w.trip_idx[0]] == "A"
+
+
+def test_unknown_anchor_is_rejected():
+    with pytest.raises(ValueError, match="anchor must be"):
+        build_windows({"A": _fake_trip("A", 2000)}, horizon_s=600, anchor="middle")
+
+
+def test_interior_state_is_unobservable_from_a_short_history():
+    """Why trip_start exists: with tau_mass ~25 min, five minutes of measured
+    cabin temperature cannot recover the interior state, however it is
+    estimated. The observer nails the fast state and misses the slow one."""
+    m = _oracle()
+    u = _excited_inputs(1, 900, seed=71)
+    idx = torch.zeros(1, dtype=torch.long)
+    with torch.no_grad():
+        truth0 = torch.tensor([[5.0, 20.0, 0.0]])       # interior 15 K above the air
+        traj = m.rollout(truth0, u, idx)
+        est = m.initial_state_from_history(traj[:, :300, 0], u[:, :300])
+    true_at_300 = traj[0, 299]
+    assert float(est[0, 2]) == pytest.approx(float(true_at_300[2]), rel=0.01)   # Q_del: fine
+    assert abs(float(est[0, 1]) - float(true_at_300[1])) > 5.0                  # T_mass: not
+
+
+def test_ua1_frozen_when_no_window_sustains_highway_speed():
+    """The winter failure: global speed varies but no window pairs high speed
+    with a warm cabin, so UA1 has no gradient."""
+    from etm.plant.fit import unidentifiable
+    w, _ = _synthetic_windows(n_windows=4, steps=300, seed=61)
+    w.u[..., 3] = 8.0                      # urban crawl throughout
+    assert "ua1" in unidentifiable(w)
+
+
+def test_ua1_identifiable_when_a_window_holds_highway_speed():
+    from etm.plant.fit import unidentifiable
+    w, _ = _synthetic_windows(n_windows=4, steps=300, seed=62)
+    w.u[..., 3] = 8.0
+    w.u[0, :, 3] = 28.0                    # one window is a motorway leg
+    assert "ua1" not in unidentifiable(w)
+
+
+# --------------------------------------------------------------------------
+# steady-state UA identification (the UA1 finding)
+# --------------------------------------------------------------------------
+
+def _steady_trip(name, n=3000, ua0=40.0, ua1=0.0, amb=3.0, aux=300.0,
+                 eta=0.96, speed_ms=15.0, seed=0):
+    """A synthetic warm-cabin holding trip with a KNOWN envelope conductance."""
+    rng = np.random.default_rng(seed)
+    cab = 22.0 + rng.normal(0, 0.02, n).cumsum() * 0.001    # near setpoint, nearly flat
+    cab = np.clip(cab, 21.0, 23.0)
+    v = np.abs(rng.normal(speed_ms, 5.0, n))
+    dT = cab - amb
+    # invert the steady balance to get the power that would hold this cabin
+    p = ((ua0 + ua1 * v) * dT - aux) / eta
+    p = np.clip(p + rng.normal(0, 20, n), 200, 7000)
+    return pd.DataFrame({
+        "trip": name, "time_s": np.arange(n, dtype=float),
+        "cabin_temp_c": cab, "amb_temp_c": np.full(n, amb),
+        "velocity_kmh": v * 3.6, "heat_power_req_w": p,
+    })
+
+
+def test_steady_state_recovers_a_known_ua1():
+    """If the data really has speed-dependent loss, the regression must find it."""
+    from etm.plant.steady_state import identify_ua_steady_state
+    trips = {f"T{i}": _steady_trip(f"T{i}", ua0=40.0, ua1=3.0,
+                                   speed_ms=10.0 + 6 * i, seed=i) for i in range(6)}
+    res = identify_ua_steady_state(trips)
+    assert res.ua1_within_trip == pytest.approx(3.0, abs=0.8), res.summary()
+    assert res.speed_dependence_detected
+
+
+def test_steady_state_reports_zero_when_loss_is_speed_independent():
+    """The real-data case: no speed dependence must read as zero, not as noise
+    dressed up as a small positive number."""
+    from etm.plant.steady_state import identify_ua_steady_state
+    trips = {f"T{i}": _steady_trip(f"T{i}", ua0=40.0, ua1=0.0,
+                                   speed_ms=8.0 + 5 * i, seed=i) for i in range(6)}
+    res = identify_ua_steady_state(trips)
+    assert abs(res.ua1_within_trip) < 0.5, res.summary()
+    assert not res.speed_dependence_detected
+
+
+def test_steady_state_mask_selects_warm_flat_heater_on_samples():
+    from etm.plant.steady_state import steady_state_mask
+    n = 600
+    df = pd.DataFrame({
+        "time_s": np.arange(n, dtype=float),
+        "cabin_temp_c": np.concatenate([np.linspace(2, 22, 300), np.full(300, 22.0)]),
+        "amb_temp_c": np.full(n, 3.0),
+        "velocity_kmh": np.full(n, 40.0),
+        "heat_power_req_w": np.full(n, 1500.0),
+    })
+    m = steady_state_mask(df)
+    assert m[:250].sum() == 0            # warm-up phase excluded (still rising)
+    assert m[350:].sum() > 200           # the holding phase is selected
+
+
+def test_steady_state_needs_a_real_temperature_gradient():
+    """Dividing by a near-zero cabin-ambient gap is where this analysis breaks;
+    the mask must refuse those samples."""
+    from etm.plant.steady_state import steady_state_mask
+    n = 400
+    df = pd.DataFrame({
+        "time_s": np.arange(n, dtype=float),
+        "cabin_temp_c": np.full(n, 22.0),
+        "amb_temp_c": np.full(n, 21.0),     # only 1 K gap -- below min_dt_c
+        "velocity_kmh": np.full(n, 30.0),
+        "heat_power_req_w": np.full(n, 1500.0),
+    })
+    assert steady_state_mask(df).sum() == 0

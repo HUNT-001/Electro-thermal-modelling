@@ -164,7 +164,8 @@ The A/C compressor runs in 0–6 % of winter rows and averages a few watts, so
 6.0–7.3, above any physical COP, while the loss barely noticed. `unidentifiable()`
 detects an unexcited input, holds the parameter at its initial value, and the
 fit reports `NOT IDENTIFIED` rather than printing a number with no information
-in it. The same check covers `UA₁` when speed does not vary.
+in it. `UA₁` is handled separately and more directly — see *UA₁ ≈ 0 is a
+finding* below.
 
 #### One bound was moved, on the record
 
@@ -174,13 +175,25 @@ whole interior's heat capacity; five folds independently agreed on
 surface layer — seat and trim skin, glass — not the full mass. Five folds beat
 one guess. The bound moves once, not every time the data disagrees.
 
+#### UA₁ ≈ 0 is a finding, not a data gap — settled by a direct heat balance
+
+The rollout left `UA₁` (the speed dependence of envelope loss) pinned at zero,
+and it was never clear whether that was real or just too little highway data.
+`etm/plant/steady_state.py` answers it without the rollout, by a heat-balance
+regression any reviewer can check by hand: on quasi-steady warm segments the
+cabin balance collapses to `η·P ≈ (UA₀ + UA₁·v)·(T_cab − T_amb) + Q_aux`, so
+regressing `η·P` on `ΔT` and `v·ΔT` reads `UA₀` and `UA₁` off directly. Run it
+with `python -m etm identify-ua`. On this dataset three independent estimators
+agree on zero: `UA₁ ≈ +0.03` W/K per m/s pooled, `+0.007` with per-trip fixed
+effects (which cancel `Q_aux` exactly), a speed–loss correlation of ~0.05, and
+the fastest trip carrying a *lower* loss ratio than several city trips. The i3
+heats recirculated air once warm, so envelope loss is dominated by conduction
+through glass and body, which does not scale with road speed. `UA₁` is now
+frozen at zero as a **documented, evidenced** assumption — valid for this
+recirculating cabin to ~42 m/s, and a term a fresh-air-intake mode would restore.
+
 ### Still open
 
-- **UA₁ collapses to ~0** — the speed dependence of envelope loss is not
-  identified even with speed varying. Only three highway trips (B10, B12, B14)
-  carry real excitation and they are split across folds. Until this is fixed
-  the model will understate heat loss at motorway speed, which is exactly the
-  case long-trip range prediction depends on.
 - **The 60 s deficit is reduced but not gone.** Worth deciding whether it
   matters: an MPC planning over 5–20 min does not need 60 s accuracy, and the
   honest move may be to state the model's valid horizon rather than chase it.
@@ -348,5 +361,27 @@ spread is large, so individual trip numbers should not be quoted alone.
 Two further honest limits: the OEM controller is optimising things this cost
 function does not model — demisting, humidity, vent-level perceived comfort —
 so "beating" it on cabin air temperature alone is not the same as beating it on
-the job it was designed for. And UA₁ is still zero, so the plant has no
-speed-dependent heat loss; savings on motorway trips are the least trustworthy.
+the job it was designed for. And `UA₁` is zero — now confirmed as a physical
+property of this recirculating cabin rather than a data gap (see L1) — so the
+plant has no speed-dependent heat loss; that is correct up to ~42 m/s, but a
+fresh-air-intake mode or genuinely higher speeds would need the term restored.
+
+## L5 — a safety supervisor between the controller and the heater
+
+`etm/control/supervisor.py` is the piece an OEM would actually ask for. Nothing
+in L1–L3 can be certified — an identified plant, a forecaster, an optimiser are
+all models with no guaranteed behaviour. The supervisor is deliberately the
+least clever code in the project: no learning, a handful of inspectable rules
+with final say over the heater command. The learned controller *proposes*; the
+supervisor *disposes*. Every proposed action passes an ordered set of guards —
+`SensorValid` (NaN or absurd cabin reading), `InputEnvelope` (ambient or speed
+outside the identified range), `ActuatorClamp` (hard `[0, 7000]` W limit, NaN
+treated as a fault), `RateLimit` (slew limit) — and on a genuine fault control
+hands to a deterministic fallback (the OEM trace or a PI loop) rather than
+trusting a model outside the conditions it was built on. Every override is
+recorded with its reason, so the takeover is auditable after the fact — the OEM
+question is not "does the ML controller work" but "what happens when it doesn't,
+and can you prove the car stays safe". Run `python -m etm control --supervised`
+for a demo that injects sensor dropouts and out-of-envelope operation and shows
+the heater staying within limits and finite throughout. Covered by
+`tests/test_supervisor.py`.
